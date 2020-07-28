@@ -4,7 +4,14 @@ using Fiskaly.Errors;
 using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
+#if NET40
+using System.Net;
+#elif NETSTANDARD2_0
+using System.Net.Http;
+using System.Net.Http.Headers;
+#endif
 
 namespace Fiskaly
 {
@@ -45,11 +52,11 @@ namespace Fiskaly
         }
 
         private void InitializeClient() {
-        #if NET40
+#if NET40
             this.Client = new WindowsClient();
 
         // Non-Windows platforms are only supported through .NET Standard 2.1 at the moment
-        #elif NETSTANDARD2_0
+#elif NETSTANDARD2_0
 
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
@@ -57,20 +64,20 @@ namespace Fiskaly
             }
             else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
             {
-                #if Android
+#if Android
                     Client = new AndroidClient();
-                #else
+#else
                     Client = new LinuxClient();
-                #endif
+#endif
             }
             else
             {
                 Client = new LinuxClient();
             }
         // Use Windows as default for safety
-        #else
+#else
             Client = new WindowsClient();
-        #endif
+#endif
         }
 
         private void InitializeContext()
@@ -113,29 +120,48 @@ namespace Fiskaly
 
         private FiskalyHttpError CreateFiskalyHttpError<T>(JsonRpcResponse<T> response)
         {
+            System.Diagnostics.Debug.WriteLine(response.Error.Data.ToString());
             ErrorData errorData = JsonConvert
                 .DeserializeObject<ErrorData>(response.Error.Data.ToString());
-
+           
             FiskalyApiError errorBody = JsonConvert
-                .DeserializeObject<FiskalyApiError>(
-                    Transformer.DecodeBase64Body(errorData.Response.Body));
+                    .DeserializeObject<FiskalyApiError>(
+                        Transformer.DecodeBase64Body(errorData.Response.Body));
 
-            string[] requestIdHeaders;
+            try
+            {
+                string[] requestIdHeaders;
 
-            errorData
-                .Response
-                .Headers
-                .TryGetValue("x-request-id", out requestIdHeaders);
+                errorData
+                    .Response
+                    .Headers
+                    .TryGetValue("x-request-id", out requestIdHeaders);
 
-            string requestId = requestIdHeaders[0];
+                string requestId = requestIdHeaders[0];
 
-            return new FiskalyHttpError(
-                response.Error.Code,
-                errorBody.Error,
-                errorBody.Message,
-                errorBody.Code,
-                requestId
-            );
+                return new FiskalyHttpError(
+                    response.Error.Code,
+                    errorBody.Error,
+                    errorBody.Message,
+                    errorBody.Code,
+                    requestId
+                );
+            }
+            catch (JsonReaderException)
+            {
+                if (errorData.Response.Status == 429)
+                {
+                    return new FiskalyHttpError(
+                        response.Error.Code,
+                        "Too Many Requests",
+                        "Rate limit exceeded, retry in 1 minute",
+                        "429",
+                        response.RequestId
+                    );
+                }
+
+                throw;
+            }
         }
 
         private FiskalyClientError CreateFiskalyClientError<T>(JsonRpcResponse<T> response)
@@ -190,6 +216,31 @@ namespace Fiskaly
                 Headers = rpcResponse.Result.Response.Headers,
                 Body = Transformer.DecodeBase64BytesToUtf8Bytes(rpcResponse.Result.Response.Body)
             };
+        }
+
+        public Stream DownloadExport(string href)
+        {
+            if (!InitialContextSet)
+            {
+                InitializeContext();
+            }
+
+            if (!href.StartsWith(BaseUrl))
+            {
+                throw new ArgumentException("Export have to be retrieved from API endpoint");
+            }
+#if NET40
+            var request = WebRequest.Create(href);
+            request.Headers.Add("Bearer", Context);
+            var response = request.GetResponse();
+            return response.GetResponseStream();
+
+#elif NETSTANDARD2_0
+            HttpClient c = new HttpClient();
+            c.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", Context);
+
+            return c.GetStreamAsync(href).ConfigureAwait(false).GetAwaiter().GetResult();
+#endif
         }
 
         public ClientConfiguration ConfigureClient(ClientConfiguration configuration)
