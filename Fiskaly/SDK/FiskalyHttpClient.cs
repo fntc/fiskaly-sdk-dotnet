@@ -4,14 +4,7 @@ using Fiskaly.Errors;
 using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Runtime.InteropServices;
-#if NET40
-using System.Net;
-#elif NETSTANDARD2_0
-using System.Net.Http;
-using System.Net.Http.Headers;
-#endif
 
 namespace Fiskaly
 {
@@ -26,6 +19,11 @@ namespace Fiskaly
         private string ApiKey { get; }
         private string ApiSecret { get; }
         private string BaseUrl { get; }
+
+        private string Email { get; set; }
+        private string Password { get; set; }
+        private string OrganizationId { get; set; }
+        private string Environment { get; set; }
 
         public FiskalyHttpClient(string apiKey, string apiSecret, string baseUrl)
         {
@@ -51,12 +49,35 @@ namespace Fiskaly
             InitializeClient();
         }
 
+        public FiskalyHttpClient(
+            string apiKey,
+            string apiSecret,
+            string baseUrl,
+            string email,
+            string password,
+            string organizationId,
+            string environment
+            ): this(apiKey, apiSecret, baseUrl)
+        {
+            this.Email = email;
+            this.Password = password;
+            this.OrganizationId = organizationId;
+            this.Environment = environment;
+        }
+
         private void InitializeClient() {
-#if NET40
-            this.Client = new WindowsClient();
+        #if NET40
+            if (System.Environment.OSVersion.Platform == PlatformID.Unix)
+            {
+                Client = new LinuxClient();
+            }
+            else
+            {
+                Client = new WindowsClient();
+            }
 
         // Non-Windows platforms are only supported through .NET Standard 2.1 at the moment
-#elif NETSTANDARD2_0
+        #elif NETSTANDARD2_0
 
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
@@ -64,26 +85,27 @@ namespace Fiskaly
             }
             else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
             {
-#if Android
+                #if Android
                     Client = new AndroidClient();
-#else
+                #else
                     Client = new LinuxClient();
-#endif
+                #endif
             }
             else
             {
                 Client = new LinuxClient();
             }
         // Use Windows as default for safety
-#else
+        #else
             Client = new WindowsClient();
-#endif
+        #endif
         }
 
         private void InitializeContext()
         {
             byte[] payload = PayloadFactory
-                .BuildCreateContextPayload(DateTime.Now.ToString(), ApiKey, ApiSecret, BaseUrl);
+                .BuildCreateContextPayload(DateTime.Now.ToString(),
+                    ApiKey, ApiSecret, BaseUrl, Email, Password, OrganizationId, Environment);
 
             string createContextResponse = Client.Invoke(payload);
             System.Diagnostics.Debug.WriteLine("CreateContextResponse: " + createContextResponse);
@@ -98,7 +120,7 @@ namespace Fiskaly
             System.Diagnostics.Debug.WriteLine("Set context to: " + Context);
         }
 
-        private byte[] CreateRequestPayload(string method, string path, byte[] body, Dictionary<string, string> headers, Dictionary<string, string> query)
+        private byte[] CreateRequestPayload(string method, string path, byte[] body, Dictionary<string, string> headers, Dictionary<string, object> query)
         {
             byte[] payload = PayloadFactory.BuildRequestPayload(DateTime.Now.ToString(),
                 new RequestParams
@@ -109,7 +131,7 @@ namespace Fiskaly
                         Path = path == null ? "/" : path,
                         Body = body == null ? new byte[0] : body,
                         Headers = headers == null ? new Dictionary<string, string>() : headers,
-                        Query = query == null ? new Dictionary<string, string>() : query
+                        Query = query == null ? new Dictionary<string, object>() : query
                     },
                     Context = Context
                 }
@@ -120,48 +142,29 @@ namespace Fiskaly
 
         private FiskalyHttpError CreateFiskalyHttpError<T>(JsonRpcResponse<T> response)
         {
-            System.Diagnostics.Debug.WriteLine(response.Error.Data.ToString());
             ErrorData errorData = JsonConvert
                 .DeserializeObject<ErrorData>(response.Error.Data.ToString());
-           
+
             FiskalyApiError errorBody = JsonConvert
-                    .DeserializeObject<FiskalyApiError>(
-                        Transformer.DecodeBase64Body(errorData.Response.Body));
+                .DeserializeObject<FiskalyApiError>(
+                    Transformer.DecodeBase64Body(errorData.Response.Body));
 
-            try
-            {
-                string[] requestIdHeaders;
+            string[] requestIdHeaders;
 
-                errorData
-                    .Response
-                    .Headers
-                    .TryGetValue("x-request-id", out requestIdHeaders);
+            errorData
+                .Response
+                .Headers
+                .TryGetValue("x-request-id", out requestIdHeaders);
 
-                string requestId = requestIdHeaders[0];
+            string requestId = requestIdHeaders[0];
 
-                return new FiskalyHttpError(
-                    response.Error.Code,
-                    errorBody.Error,
-                    errorBody.Message,
-                    errorBody.Code,
-                    requestId
-                );
-            }
-            catch (JsonReaderException)
-            {
-                if (errorData.Response.Status == 429)
-                {
-                    return new FiskalyHttpError(
-                        response.Error.Code,
-                        "Too Many Requests",
-                        "Rate limit exceeded, retry in 1 minute",
-                        "429",
-                        response.RequestId
-                    );
-                }
-
-                throw;
-            }
+            return new FiskalyHttpError(
+                response.Error.Code,
+                errorBody.Error,
+                errorBody.Message,
+                errorBody.Code,
+                requestId
+            );
         }
 
         private FiskalyClientError CreateFiskalyClientError<T>(JsonRpcResponse<T> response)
@@ -192,7 +195,7 @@ namespace Fiskaly
             }
         }
 
-        public FiskalyHttpResponse Request(string method, string path, byte[] body, Dictionary<string, string> headers, Dictionary<string, string> query)
+        public FiskalyHttpResponse Request(string method, string path, byte[] body, Dictionary<string, string> headers, Dictionary<string, object> query)
         {
             if (!InitialContextSet)
             {
@@ -216,31 +219,6 @@ namespace Fiskaly
                 Headers = rpcResponse.Result.Response.Headers,
                 Body = Transformer.DecodeBase64BytesToUtf8Bytes(rpcResponse.Result.Response.Body)
             };
-        }
-
-        public Stream DownloadExport(string href)
-        {
-            if (!InitialContextSet)
-            {
-                InitializeContext();
-            }
-
-            if (!href.StartsWith(BaseUrl))
-            {
-                throw new ArgumentException("Export have to be retrieved from API endpoint");
-            }
-#if NET40
-            var request = WebRequest.Create(href);
-            request.Headers.Add("Bearer", Context);
-            var response = request.GetResponse();
-            return response.GetResponseStream();
-
-#elif NETSTANDARD2_0
-            HttpClient c = new HttpClient();
-            c.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", Context);
-
-            return c.GetStreamAsync(href).ConfigureAwait(false).GetAwaiter().GetResult();
-#endif
         }
 
         public ClientConfiguration ConfigureClient(ClientConfiguration configuration)
@@ -340,7 +318,7 @@ namespace Fiskaly
             {
                 Proxy = new Models.ComponentHealth(rpcResponse.Result.Proxy),
                 Smaers = new Models.ComponentHealth(rpcResponse.Result.Smaers),
-                Backend = new Models.ComponentHealth(rpcResponse.Result.backend)
+                Backend = rpcResponse.Result.backend
             };
         }
     }
